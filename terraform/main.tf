@@ -91,3 +91,5 @@ resource "aws_instance" "shoplist" {
     Name = var.cluster_name
   }
 }
+
+

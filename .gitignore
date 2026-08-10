@@ -1,3 +1,8 @@
 *\terraform-temp\
 */terraform-temp/
 *.terraform
+shoplist-key.pem
+terraform_1.15.8_windows_amd64/
+.terraform/
+*.tfstate
+*.tfstate.*
