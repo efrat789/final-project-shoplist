@@ -1,38 +1,25 @@
 name: Create/Destroy Lab Infra
 
-# Runs the Lecture 4 "provision the lab instance" step entirely on GitHub-hosted
-# runners — no local Terraform/Ansible/AWS CLI install needed. Built for the
-# Windows-only, no-WSL student environment: everything below runs on
-# ubuntu-latest, students only ever click "Run workflow" twice.
+# Runs the "provision the lab instance" step entirely on GitHub-hosted
+# runners — no local Terraform/Ansible/AWS CLI install needed.
 #
-# Two independent manual dispatches — no GitHub Environment/required-reviewers
-# setup needed, the approval gate is simply "a human chose to run this a
-# second time after reading the plan":
-#   stage: plan    — always dispatched first. Computes the Terraform plan
-#                    (create or destroy) and posts it to the job summary.
-#                    Nothing touches AWS beyond a read-only plan. Uploads the
-#                    plan file as an artifact.
-#   stage: confirm — dispatched second, by hand, after a human reads the plan
-#                    job's summary. Fetches that exact plan artifact and runs
-#                    `terraform apply` on it — no re-planning, no drift between
-#                    what was reviewed and what happens. Refuses to run if the
-#                    plan it finds doesn't match the action/key_name requested
-#                    now (guards against confirming a stale or wrong plan).
+# State handling: Terraform state lives in the S3 bucket configured in
+# terraform/backend.tf. No artifacts, no state passing between runs — every
+# job just runs `terraform init` and reads/writes the same S3 state.
 #
-# State handling: Terraform's local backend writes terraform.tfstate to the
-# runner's disk, which is thrown away when the job ends. To survive across
-# separate workflow runs, state is uploaded as a build artifact after every
-# run and downloaded from the most recent successful run before init. No S3
-# bucket, no Terraform Cloud account — state lives in GitHub Actions
-# artifacts only.
+# Two manual dispatches (the approval gate is "a human chose to run this a
+# second time after reading the plan"):
+#   stage: plan    — computes the Terraform plan (create or destroy) and
+#                    posts it to the job summary. Read-only, touches nothing.
+#   stage: confirm — run it after reading the plan summary. Plans again
+#                    against the current S3 state and applies. Because state
+#                    is in S3, whatever you saw in the plan stage is what
+#                    will happen here (as long as nothing else changed AWS
+#                    in between).
 #
-# SSH key handling: unlike an earlier version of this pipeline, the keypair is
-# NOT generated per run — you create an AWS key pair once yourself and put its
-# private key in the EC2_SSH_KEY repo secret (same secret ci-cd.yml already
-# uses for deploys), then pass that key pair's name as the key_name input.
-# This keeps the same key valid across every apply/destroy cycle instead of
-# minting a new one that only matches a instance created in that same run —
-# see docs/lecture-4-final-lesson/secrets-setup.md for the one-time setup.
+# SSH key handling: create an AWS key pair once yourself, put its private
+# key in the EC2_SSH_KEY repo secret, and pass the key pair's name as the
+# key_name input.
 
 on:
   workflow_dispatch:
@@ -59,9 +46,13 @@ on:
 env:
   AWS_REGION: eu-west-1
 
+# S3 backend has no locking here, so never let two runs touch state at once.
+concurrency:
+  group: lab-infra
+  cancel-in-progress: false
+
 permissions:
   contents: read
-  actions: read
 
 jobs:
   plan:
@@ -80,25 +71,9 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
-      # - name: Find last successful run of this workflow (for prior state)
-      #   id: last_run
-      #   run: |
-      #     RUN_ID=$(gh run list --workflow=create-infra.yml --status=success \
-      #       --json databaseId --limit 1 --jq '.[0].databaseId // empty')
-      #     echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # - name: Download previous Terraform state
-      #   if: steps.last_run.outputs.run_id != ''
-      #   uses: actions/download-artifact@v4
-      #   with:
-      #     name: tfstate
-      #     path: terraform/
-      #     github-token: ${{ secrets.GITHUB_TOKEN }}
-      #     run-id: ${{ steps.last_run.outputs.run_id }}
-      #   continue-on-error: true # first-ever run: no artifact yet, that's fine
+        with:
+          # The wrapper corrupts $(terraform output ...) captures — keep it off.
+          terraform_wrapper: false
 
       - name: Terraform init
         working-directory: terraform
@@ -127,27 +102,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Record what this plan was for (confirm step checks this matches)
-        working-directory: terraform
-        run: echo "${{ inputs.action }} ${{ inputs.key_name }}" > plan-meta.txt
-
-      - name: Upload plan file
-        uses: actions/upload-artifact@v4
-        with:
-          name: tfplan
-          path: |
-            terraform/tfplan
-            terraform/plan-meta.txt
-          retention-days: 3
-
-      # - name: Upload Terraform state (unchanged pass-through)
-      #   if: always()
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: tfstate
-      #     path: terraform/terraform.tfstate
-      #     retention-days: 30
-
   confirm:
     if: inputs.stage == 'confirm'
     runs-on: ubuntu-latest
@@ -172,54 +126,22 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
-      - name: Find last successful run of this workflow (should be the plan being confirmed)
-        id: last_run
-        run: |
-          RUN_ID=$(gh run list --workflow=create-infra.yml --status=success \
-            --json databaseId --limit 1 --jq '.[0].databaseId // empty')
-          if [ -z "$RUN_ID" ]; then
-            echo "::error::No previous successful run found — run this workflow with stage=plan first."
-            exit 1
-          fi
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download the plan to confirm
-        uses: actions/download-artifact@v4
         with:
-          name: tfplan
-          path: terraform/
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ steps.last_run.outputs.run_id }}
-
-      # - name: Download prior state
-      #   uses: actions/download-artifact@v4
-      #   with:
-      #     name: tfstate
-      #     path: terraform/
-      #     github-token: ${{ secrets.GITHUB_TOKEN }}
-      #     run-id: ${{ steps.last_run.outputs.run_id }}
-      #   continue-on-error: true
-
-      - name: Verify the plan matches what's being confirmed now
-        working-directory: terraform
-        run: |
-          EXPECTED="${{ inputs.action }} ${{ inputs.key_name }}"
-          ACTUAL="$(cat plan-meta.txt)"
-          if [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "::error::Most recent plan was for '$ACTUAL', but confirm was requested for '$EXPECTED'. Run stage=plan again with the action/key_name you actually want, then confirm that."
-            exit 1
-          fi
+          terraform_wrapper: false
 
       - name: Terraform init
         working-directory: terraform
         run: terraform init -input=false
 
-      - name: Terraform apply (exactly the reviewed plan — no re-planning)
+      - name: Terraform apply
+        if: inputs.action == 'apply'
         working-directory: terraform
-        run: terraform apply -input=false tfplan
+        run: terraform apply -input=false -auto-approve -var "key_name=${{ inputs.key_name }}"
+
+      - name: Terraform destroy
+        if: inputs.action == 'destroy'
+        working-directory: terraform
+        run: terraform apply -destroy -input=false -auto-approve -var "key_name=${{ inputs.key_name }}"
 
       - name: Get public IP
         if: inputs.action == 'apply'
@@ -238,6 +160,7 @@ jobs:
       - name: Wait for SSH
         if: inputs.action == 'apply'
         working-directory: terraform
+        timeout-minutes: 5
         run: |
           until ssh -i lab-key -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
             "ubuntu@${PUBLIC_IP}" true 2>/dev/null; do
@@ -284,11 +207,3 @@ jobs:
       - name: Job summary (destroy)
         if: inputs.action == 'destroy'
         run: echo "### Lab instance destroyed — remove the EC2_HOST secret if you're done with the lab (EC2_SSH_KEY and the AWS key pair can stay for next time)" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload Terraform state
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tfstate
-          path: terraform/terraform.tfstate
-          retention-days: 30
